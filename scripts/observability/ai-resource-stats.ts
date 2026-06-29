@@ -1,11 +1,21 @@
 /**
  * AI Resource Stats — parses Claude Code transcripts in ~/.claude/projects/,
- * appends derived agent/skill invocation records to ~/.claude/observability/invocations.jsonl,
- * and emits a markdown report from the ledger.
+ * derives per-message token usage + USD cost, attributes each session to a Jira
+ * ticket, and emits the aggregated data as JSON:
  *
- * See ai-observability-plan.md for the design rationale.
+ *   1. Cost per session            — what each session cost, by model + cache tier
+ *   2. Sessions aggregated per Jira — total spend grouped by ticket tag
+ *   3. Cost by model + daily cost
  *
- * Run: pnpm tsx scripts/observability/ai-resource-stats.ts [options]
+ * This module computes DATA ONLY. It does not render tables or format numbers —
+ * stdout is the raw `ReportData` object as JSON, and a consuming agent owns all
+ * presentation. The `buildReportData()` function is exported so an agent can
+ * import and call it directly instead of shelling out.
+ *
+ * The ledger at ~/.claude/observability/usage.jsonl is built incrementally
+ * (offset-tracked per transcript file), so re-runs only process new data.
+ *
+ * Run: pnpm tsx scripts/observability/ai-resource-stats.ts [options] > data.json
  */
 
 import fs from 'node:fs';
@@ -18,8 +28,43 @@ import os from 'node:os';
 
 const PROJECTS_DIR = path.join(os.homedir(), '.claude', 'projects');
 const OBS_DIR = path.join(os.homedir(), '.claude', 'observability');
-const LEDGER = path.join(OBS_DIR, 'invocations.jsonl');
-const STATE = path.join(OBS_DIR, 'state.json');
+const LEDGER = path.join(OBS_DIR, 'usage.jsonl');
+const STATE = path.join(OBS_DIR, 'usage-state.json');
+// Authoritative session→ticket ledger written by the branch-derived hooks.
+const TICKET_LEDGER = path.join(OBS_DIR, 'session-tickets.jsonl');
+
+// ---------------------------------------------------------------------------
+// Pricing — USD per token. Sourced from the Anthropic pricing reference
+// (claude-api skill, cached 2026-05). Base input/output rates per model; cache
+// read = 0.1× input, cache write = 1.25× input (5-minute TTL) / 2× input (1-hour).
+// Match is by substring on the model id so dated/suffixed variants still resolve.
+// ---------------------------------------------------------------------------
+
+interface ModelPrice {
+  input: number; // USD per input token
+  output: number; // USD per output token
+}
+
+const PER_MTOK = (n: number) => n / 1_000_000;
+
+const PRICING: Array<{ match: string; price: ModelPrice }> = [
+  { match: 'fable', price: { input: PER_MTOK(10), output: PER_MTOK(50) } },
+  { match: 'opus', price: { input: PER_MTOK(5), output: PER_MTOK(25) } },
+  { match: 'sonnet', price: { input: PER_MTOK(3), output: PER_MTOK(15) } },
+  { match: 'haiku', price: { input: PER_MTOK(1), output: PER_MTOK(5) } },
+];
+
+const CACHE_READ_MULTIPLIER = 0.1;
+const CACHE_WRITE_5M_MULTIPLIER = 1.25;
+const CACHE_WRITE_1H_MULTIPLIER = 2.0;
+
+function priceFor(model: string): ModelPrice | null {
+  const lower = model.toLowerCase();
+  for (const { match, price } of PRICING) {
+    if (lower.includes(match)) return price;
+  }
+  return null;
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -30,19 +75,23 @@ interface State {
   files: Record<string, { lastOffset: number; lastMtime: number }>;
 }
 
-interface Invocation {
+/**
+ * One record per assistant message that reported usage. Token counts are raw;
+ * cost is derived at report time so a pricing change re-prices the whole ledger
+ * without a rebuild.
+ */
+interface UsageRecord {
   ts: number;
   project: string;
   session: string;
-  kind: 'agent' | 'skill';
-  resource: string;
-  succeeded: boolean;
-  durationMs: number;
-  returnChars: number;
-  precedingUserText: string;
-  isSidechain: boolean;
-  parentTool: string | null;
-  toolUseId: string;
+  model: string;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWrite5mTokens: number;
+  cacheWrite1hTokens: number;
+  branch: string | null;
+  ticket: string | null; // derived from `branch` (e.g. FS-5198), or null
 }
 
 interface Args {
@@ -51,13 +100,6 @@ interface Args {
   project?: string;
   allProjects: boolean;
   includeNonRepos: boolean;
-}
-
-interface ProjectRule {
-  name: string;
-  globs: string[];
-  alwaysApply: boolean;
-  regexes: RegExp[];
 }
 
 /**
@@ -69,12 +111,13 @@ interface TranscriptEvent {
   type?: string;
   message?: {
     role?: string;
-    content?: Array<Record<string, unknown>> | string;
+    model?: string;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    usage?: any;
   };
   timestamp?: string | number;
-  isSidechain?: boolean;
   sessionId?: string;
-  parentUuid?: string | null;
+  gitBranch?: string;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   attachment?: any;
 }
@@ -106,6 +149,8 @@ function parseArgs(argv: string[]): Args {
 
 function printUsage(): void {
   console.log(`Usage: pnpm tsx scripts/observability/ai-resource-stats.ts [options]
+
+Reports Claude Code cost per session and sessions aggregated per Jira ticket.
 
 Options:
   --rebuild              Wipe the ledger and re-derive from current transcripts
@@ -189,6 +234,16 @@ function isProjectIncluded(slug: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// Ticket derivation — pull a Jira tag (e.g. FS-5198) from a git branch name.
+// ---------------------------------------------------------------------------
+
+function ticketFromBranch(branch: string | null | undefined): string | null {
+  if (!branch) return null;
+  const m = branch.match(/[A-Z]{2,}-\d+/);
+  return m ? m[0] : null;
+}
+
+// ---------------------------------------------------------------------------
 // State load / save
 // ---------------------------------------------------------------------------
 
@@ -197,7 +252,7 @@ function loadState(): State {
   try {
     return JSON.parse(fs.readFileSync(STATE, 'utf-8')) as State;
   } catch {
-    console.error('warning: state.json unreadable; treating as empty');
+    console.error('warning: usage-state.json unreadable; treating as empty');
     return { version: 1, files: {} };
   }
 }
@@ -210,39 +265,33 @@ function saveState(state: State): void {
 }
 
 // ---------------------------------------------------------------------------
-// Ingest: walk new transcript ranges, derive records, append to the ledger
+// Ingest: walk new transcript ranges, derive usage records, append to the ledger
 // ---------------------------------------------------------------------------
 
 interface IngestStats {
   appended: number;
   filesProcessed: number;
   unparseable: number;
-  unknownSamples: string[];
-  toolNameCounts: Map<string, number>;
+  modelsSeen: Map<string, number>;
+  unpricedModels: Set<string>;
 }
 
 function ingest(state: State): IngestStats {
   fs.mkdirSync(OBS_DIR, { recursive: true });
-  if (!fs.existsSync(PROJECTS_DIR)) {
-    console.error(`warning: ${PROJECTS_DIR} does not exist`);
-    return {
-      appended: 0,
-      filesProcessed: 0,
-      unparseable: 0,
-      unknownSamples: [],
-      toolNameCounts: new Map(),
-    };
-  }
-
   const stats: IngestStats = {
     appended: 0,
     filesProcessed: 0,
     unparseable: 0,
-    unknownSamples: [],
-    toolNameCounts: new Map(),
+    modelsSeen: new Map(),
+    unpricedModels: new Set(),
   };
-  // Accumulate records in memory, write once at the end synchronously.
-  // Avoids the WriteStream-flush race that left the ledger empty on first run.
+  if (!fs.existsSync(PROJECTS_DIR)) {
+    console.error(`warning: ${PROJECTS_DIR} does not exist`);
+    return stats;
+  }
+
+  // Accumulate in memory, write once at the end synchronously — avoids the
+  // WriteStream-flush race that can leave the ledger empty on first run.
   const recordsToWrite: string[] = [];
 
   // Ingest from ALL projects — the ledger is complete; filtering happens at report time.
@@ -264,17 +313,15 @@ function ingest(state: State): IngestStats {
       const startOffset = !prev || stat.size < prev.lastOffset ? 0 : prev.lastOffset;
 
       const newLines = readFromOffset(full, startOffset);
-      const result = deriveInvocations(newLines, project);
-      for (const r of result.invocations) {
+      const result = deriveUsage(newLines, project);
+      for (const r of result.records) {
         recordsToWrite.push(JSON.stringify(r));
       }
-      stats.appended += result.invocations.length;
+      stats.appended += result.records.length;
       stats.unparseable += result.unparseable;
-      for (const s of result.unknownSamples) {
-        if (stats.unknownSamples.length < 5) stats.unknownSamples.push(s);
-      }
-      for (const [name, n] of result.toolNameCounts) {
-        stats.toolNameCounts.set(name, (stats.toolNameCounts.get(name) ?? 0) + n);
+      for (const [m, n] of result.modelsSeen) {
+        stats.modelsSeen.set(m, (stats.modelsSeen.get(m) ?? 0) + n);
+        if (m !== '<synthetic>' && !priceFor(m)) stats.unpricedModels.add(m);
       }
       stats.filesProcessed++;
 
@@ -303,45 +350,35 @@ function readFromOffset(file: string, offset: number): string[] {
 }
 
 // ---------------------------------------------------------------------------
-// Event derivation
+// Usage derivation
 // ---------------------------------------------------------------------------
 //
-// Events of interest in the jsonl:
+// Assistant messages carry a `usage` block and a `model`:
+//   { message: { role: 'assistant', model: 'claude-opus-4-8', usage: {
+//       input_tokens, output_tokens, cache_read_input_tokens,
+//       cache_creation_input_tokens,
+//       cache_creation: { ephemeral_5m_input_tokens, ephemeral_1h_input_tokens } } },
+//     timestamp, sessionId, gitBranch }
 //
-//   Assistant tool_use:
-//     { message: { role: 'assistant', content: [
-//       { type: 'tool_use', id: 'toolu_xxx', name: 'Agent'|'Skill', input: {...} }
-//     ]}, timestamp, isSidechain, sessionId }
-//
-//   User tool_result (the corresponding return):
-//     { message: { role: 'user', content: [
-//       { type: 'tool_result', tool_use_id: 'toolu_xxx', content: '...', is_error?: bool }
-//     ]}, timestamp }
-//
-//   User text (for trigger-phrase capture):
-//     { message: { role: 'user', content: [{ type: 'text', text: '...' }] } }
-//     (or string content for older format)
-//
-// Everything else we skip; if we see an event whose 'type' or top-level shape
-// we don't recognise, we log a sample for diagnostic purposes.
+// `gitBranch` is a top-level field on most events; we carry the last-seen branch
+// forward within a file so usage events that omit it still get attributed.
 
 interface DeriveResult {
-  invocations: Invocation[];
+  records: UsageRecord[];
   unparseable: number;
-  unknownSamples: string[];
-  toolNameCounts: Map<string, number>;
+  modelsSeen: Map<string, number>;
 }
 
-function deriveInvocations(lines: string[], project: string): DeriveResult {
-  const invocations: Invocation[] = [];
-  const pending = new Map<
-    string,
-    { ts: number; resource: string; kind: 'agent' | 'skill'; isSidechain: boolean; sessionId: string }
-  >();
-  const recentUserText: string[] = [];
+function num(v: unknown): number {
+  return typeof v === 'number' && isFinite(v) ? v : 0;
+}
+
+function deriveUsage(lines: string[], project: string): DeriveResult {
+  const records: UsageRecord[] = [];
+  const modelsSeen = new Map<string, number>();
   let unparseable = 0;
-  const unknownSamples: string[] = [];
-  const toolNameCounts = new Map<string, number>();
+  // Last-seen git branch, per session, so usage events lacking gitBranch inherit it.
+  const lastBranch = new Map<string, string>();
 
   for (const line of lines) {
     let event: TranscriptEvent;
@@ -352,102 +389,47 @@ function deriveInvocations(lines: string[], project: string): DeriveResult {
       continue;
     }
 
-    // Skip known non-message events silently
-    if (!event.message) {
-      const knownNonMessage = [
-        'permission-mode',
-        'summary',
-        'file-history-snapshot',
-        'queue-operation',
-        'last-prompt',
-        'system', // covers turn_duration, away_summary, etc.
-        'ai-title',
-        'custom-title',
-      ];
-      const hasAttachment = !!event.attachment;
-      if (event.type && knownNonMessage.includes(event.type)) continue;
-      if (hasAttachment) continue;
-      // Unknown shape — sample it once
-      if (unknownSamples.length < 5) unknownSamples.push(line.slice(0, 200));
-      continue;
+    const sessionId = event.sessionId ?? 'unknown';
+    if (typeof event.gitBranch === 'string' && event.gitBranch) {
+      lastBranch.set(sessionId, event.gitBranch);
     }
 
     const msg = event.message;
-    const ts = parseTimestamp(event.timestamp) ?? Date.now();
-    const isSidechain = event.isSidechain === true;
-    const sessionId = event.sessionId ?? 'unknown';
-    const content = Array.isArray(msg.content) ? msg.content : null;
+    if (!msg || msg.role !== 'assistant' || !msg.usage) continue;
 
-    if (msg.role === 'user') {
-      // Tool results live in user-role messages
-      if (content) {
-        for (const block of content) {
-          if (block.type === 'tool_result' && typeof block.tool_use_id === 'string') {
-            const p = pending.get(block.tool_use_id);
-            if (p) {
-              pending.delete(block.tool_use_id);
-              const resultContent =
-                typeof block.content === 'string' ? block.content : JSON.stringify(block.content ?? '');
-              invocations.push({
-                ts: p.ts,
-                project,
-                session: p.sessionId,
-                kind: p.kind,
-                resource: p.resource,
-                succeeded: block.is_error !== true,
-                durationMs: Math.max(0, ts - p.ts),
-                returnChars: resultContent.length,
-                precedingUserText: recentUserText.slice(-1)[0] ?? '',
-                isSidechain: p.isSidechain,
-                parentTool: null,
-                toolUseId: block.tool_use_id,
-              });
-            }
-          } else if (block.type === 'text' && typeof block.text === 'string') {
-            const t = block.text.trim();
-            if (t) pushRecent(recentUserText, t.slice(0, 200));
-          }
-        }
-      } else if (typeof msg.content === 'string') {
-        const t = msg.content.trim();
-        if (t) pushRecent(recentUserText, t.slice(0, 200));
-      }
-    } else if (msg.role === 'assistant') {
-      if (!content) continue;
-      for (const block of content) {
-        if (block.type !== 'tool_use') continue;
-        const name = typeof block.name === 'string' ? block.name : '';
-        // Track every tool name we see, so we can verify the filter below is correct
-        if (name) toolNameCounts.set(name, (toolNameCounts.get(name) ?? 0) + 1);
-        if (name !== 'Agent' && name !== 'Skill' && name !== 'Task') continue;
-        if (typeof block.id !== 'string') continue;
-        const input = (block.input ?? {}) as Record<string, unknown>;
-        const kind: 'agent' | 'skill' = name === 'Skill' ? 'skill' : 'agent';
-        // For agents, the resource is the subagent TYPE, not the per-invocation task
-        // description. When subagent_type is omitted, the harness defaults to
-        // 'general-purpose', so we do the same here. Never fall back to description —
-        // that conflates agent identity with per-call task labels.
-        const resource =
-          (kind === 'agent'
-            ? ((input.subagent_type as string) ?? (input.agent as string) ?? 'general-purpose')
-            : (input.skill as string)) ?? 'unknown';
-        pending.set(block.id, {
-          ts,
-          resource: String(resource),
-          kind,
-          isSidechain,
-          sessionId,
-        });
-      }
+    const model = typeof msg.model === 'string' ? msg.model : 'unknown';
+    modelsSeen.set(model, (modelsSeen.get(model) ?? 0) + 1);
+    if (model === '<synthetic>') continue; // synthetic messages have no cost
+
+    const usage = msg.usage;
+    const cacheCreation = usage.cache_creation ?? {};
+    // Prefer the explicit 5m/1h breakdown; fall back to treating all cache
+    // creation as the default 5-minute TTL when the breakdown is absent.
+    let write5m = num(cacheCreation.ephemeral_5m_input_tokens);
+    let write1h = num(cacheCreation.ephemeral_1h_input_tokens);
+    if (write5m === 0 && write1h === 0) {
+      write5m = num(usage.cache_creation_input_tokens);
     }
+
+    const ts = parseTimestamp(event.timestamp) ?? Date.now();
+    const branch = lastBranch.get(sessionId) ?? null;
+
+    records.push({
+      ts,
+      project,
+      session: sessionId,
+      model,
+      inputTokens: num(usage.input_tokens),
+      outputTokens: num(usage.output_tokens),
+      cacheReadTokens: num(usage.cache_read_input_tokens),
+      cacheWrite5mTokens: write5m,
+      cacheWrite1hTokens: write1h,
+      branch,
+      ticket: ticketFromBranch(branch),
+    });
   }
 
-  return { invocations, unparseable, unknownSamples, toolNameCounts };
-}
-
-function pushRecent(buffer: string[], text: string): void {
-  buffer.push(text);
-  if (buffer.length > 20) buffer.shift();
+  return { records, unparseable, modelsSeen };
 }
 
 function parseTimestamp(ts: string | number | undefined): number | null {
@@ -460,236 +442,52 @@ function parseTimestamp(ts: string | number | undefined): number | null {
 }
 
 // ---------------------------------------------------------------------------
-// Rule activations
+// Cost
 // ---------------------------------------------------------------------------
-//
-// Rules don't appear as tool_use events — the harness loads them silently when
-// matching files come into context. So we can't observe "rule X fired at turn Y".
-//
-// What we CAN observe: for each session in the current project, which files were
-// touched (via Read/Edit/Write/NotebookEdit tool calls)? Then for each rule, was
-// at least one of those files matched by the rule's globs? That's "this rule was
-// eligible to fire" — close enough to "did fire" for spotting dead rules.
 
-// Minimal YAML frontmatter parser (flat key:value + array support). Mirrors
-// the parser in scripts/sync-ai-config.ts so the rules section can be self-contained.
-function parseSimpleFrontmatter(content: string): Record<string, unknown> {
-  const match = content.replace(/\r\n/g, '\n').match(/^---\n([\s\S]*?)\n---/);
-  if (!match) return {};
-  const out: Record<string, unknown> = {};
-  for (const line of match[1].split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith('#')) continue;
-    const colonIdx = trimmed.indexOf(':');
-    if (colonIdx === -1) continue;
-    const key = trimmed.slice(0, colonIdx).trim();
-    const value: string = trimmed.slice(colonIdx + 1).trim();
-    if (value.startsWith('[') && value.endsWith(']')) {
-      const inner = value.slice(1, -1).trim();
-      if (inner === '') out[key] = [];
-      else out[key] = inner.split(',').map((s) => s.trim().replace(/^["']|["']$/g, ''));
-    } else if (value === 'true') {
-      out[key] = true;
-    } else if (value === 'false') {
-      out[key] = false;
-    } else {
-      out[key] = value.replace(/^["']|["']$/g, '');
-    }
-  }
-  return out;
+function recordCost(r: UsageRecord): number {
+  const price = priceFor(r.model);
+  if (!price) return 0;
+  return (
+    r.inputTokens * price.input +
+    r.outputTokens * price.output +
+    r.cacheReadTokens * price.input * CACHE_READ_MULTIPLIER +
+    r.cacheWrite5mTokens * price.input * CACHE_WRITE_5M_MULTIPLIER +
+    r.cacheWrite1hTokens * price.input * CACHE_WRITE_1H_MULTIPLIER
+  );
 }
 
-// Glob → RegExp. Covers `**/`, `/**`, `**`, `*`, `?`. Skips exotic features
-// like `{a,b}` and `[abc]` — none of our rule files use them.
-function globToRegex(glob: string): RegExp {
-  let regex = '';
-  let i = 0;
-  while (i < glob.length) {
-    if (glob.startsWith('**/', i)) {
-      regex += '(?:[^/]*/)*';
-      i += 3;
-    } else if (glob.startsWith('/**', i) && i + 3 === glob.length) {
-      regex += '(?:/.*)?';
-      i += 3;
-    } else if (glob[i] === '*') {
-      if (glob[i + 1] === '*') {
-        regex += '.*';
-        i += 2;
-      } else {
-        regex += '[^/]*';
-        i++;
-      }
-    } else if (glob[i] === '?') {
-      regex += '[^/]';
-      i++;
-    } else if ('.+^${}()|[]\\'.includes(glob[i])) {
-      regex += '\\' + glob[i];
-      i++;
-    } else {
-      regex += glob[i];
-      i++;
-    }
-  }
-  return new RegExp('^' + regex + '$', 'i');
-}
+// ---------------------------------------------------------------------------
+// Authoritative session→ticket ledger (written by the branch hooks)
+// ---------------------------------------------------------------------------
 
-function loadProjectRules(repoCwd: string): ProjectRule[] {
-  const rulesDir = path.join(repoCwd, '.ai', 'rules');
-  if (!fs.existsSync(rulesDir)) return [];
-  const files = fs.readdirSync(rulesDir).filter((f) => f.endsWith('.md'));
-  const rules: ProjectRule[] = [];
-  for (const file of files) {
-    const raw = fs.readFileSync(path.join(rulesDir, file), 'utf-8');
-    const fm = parseSimpleFrontmatter(raw);
-    const name = path.basename(file, '.md');
-    const globs = Array.isArray(fm.globs) ? (fm.globs as string[]) : [];
-    const alwaysApply = fm.alwaysApply === true;
-    rules.push({ name, globs, alwaysApply, regexes: globs.map(globToRegex) });
-  }
-  return rules;
-}
-
-// Normalise a tool-call file path to repo-relative POSIX form so it matches
-// the globs declared in rule frontmatter (e.g. "apps/fs-app/src/**/*.tsx").
-function normalizePath(filePath: string, repoCwd: string): string | null {
-  const normalized = filePath.replace(/\\/g, '/');
-  const cwdNorm = repoCwd.replace(/\\/g, '/').replace(/\/$/, '');
-  if (normalized.toLowerCase().startsWith(cwdNorm.toLowerCase() + '/')) {
-    return normalized.slice(cwdNorm.length + 1);
-  }
-  if (/^[A-Za-z]:\//.test(normalized) || normalized.startsWith('/')) return null;
-  // Already relative (e.g. "apps/fs-app/src/foo.ts")
-  return normalized;
-}
-
-const FILE_TOUCHING_TOOLS = new Set(['Read', 'Edit', 'Write', 'NotebookEdit']);
-const FILE_PATH_INPUT_KEYS = ['file_path', 'notebook_path', 'path'];
-
-function extractTouchedFiles(lines: string[], repoCwd: string): Set<string> {
-  const files = new Set<string>();
+function loadTicketLedger(): Map<string, string> {
+  // session → ticket. Last entry per session wins (most recent branch state).
+  const map = new Map<string, string>();
+  if (!fs.existsSync(TICKET_LEDGER)) return map;
+  const lines = fs.readFileSync(TICKET_LEDGER, 'utf-8').split('\n').filter(Boolean);
   for (const line of lines) {
-    let event: TranscriptEvent;
     try {
-      event = JSON.parse(line) as TranscriptEvent;
+      const e = JSON.parse(line) as { session?: string; ticket?: string };
+      if (e.session && e.ticket) map.set(e.session, e.ticket);
     } catch {
-      continue;
-    }
-    const msg = event.message;
-    if (!msg || msg.role !== 'assistant') continue;
-    const content = Array.isArray(msg.content) ? msg.content : null;
-    if (!content) continue;
-    for (const block of content) {
-      if (block.type !== 'tool_use') continue;
-      const name = typeof block.name === 'string' ? block.name : '';
-      if (!FILE_TOUCHING_TOOLS.has(name)) continue;
-      const input = (block.input ?? {}) as Record<string, unknown>;
-      for (const key of FILE_PATH_INPUT_KEYS) {
-        const v = input[key];
-        if (typeof v === 'string') {
-          const norm = normalizePath(v, repoCwd);
-          if (norm) files.add(norm);
-        }
-      }
+      // skip corrupt line
     }
   }
-  return files;
-}
-
-interface RuleActivationResult {
-  activations: Map<string, Set<string>>;
-  totalSessions: number;
-  sessionsWithoutTouches: number;
-}
-
-function computeRuleActivations(
-  projectSlug: string,
-  rules: ProjectRule[],
-  repoCwd: string,
-  windowStart: number
-): RuleActivationResult {
-  const activations = new Map<string, Set<string>>();
-  for (const r of rules) activations.set(r.name, new Set());
-
-  const projectDir = path.join(PROJECTS_DIR, projectSlug);
-  if (!fs.existsSync(projectDir)) {
-    return { activations, totalSessions: 0, sessionsWithoutTouches: 0 };
-  }
-
-  let totalSessions = 0;
-  let sessionsWithoutTouches = 0;
-
-  for (const file of fs.readdirSync(projectDir)) {
-    if (!file.endsWith('.jsonl')) continue;
-    const full = path.join(projectDir, file);
-    const stat = fs.statSync(full);
-    if (stat.mtimeMs < windowStart) continue;
-
-    const sessionId = path.basename(file, '.jsonl');
-    totalSessions++;
-
-    const lines = fs.readFileSync(full, 'utf-8').split('\n').filter(Boolean);
-    const touched = extractTouchedFiles(lines, repoCwd);
-    if (touched.size === 0) sessionsWithoutTouches++;
-
-    for (const rule of rules) {
-      if (rule.alwaysApply) {
-        activations.get(rule.name)!.add(sessionId);
-        continue;
-      }
-      for (const f of touched) {
-        if (rule.regexes.some((r) => r.test(f))) {
-          activations.get(rule.name)!.add(sessionId);
-          break;
-        }
-      }
-    }
-  }
-
-  return { activations, totalSessions, sessionsWithoutTouches };
-}
-
-function emitRuleActivationsTable(
-  rules: ProjectRule[],
-  activations: Map<string, Set<string>>,
-  totalSessions: number,
-  sessionsWithoutTouches: number,
-  repoCwd: string
-): void {
-  console.log(`\n## Rule activations\n`);
-  console.log(
-    `Rules loaded from \`${path.join(repoCwd, '.ai', 'rules')}\`. ` +
-      `${totalSessions} session(s) in window (${sessionsWithoutTouches} touched no files — read-only/conversational).`
-  );
-  console.log('');
-  console.log(`| Rule | Type | Globs | Sessions matched | % |`);
-  console.log(`|------|------|-------|-----------------:|---:|`);
-  const sorted = [...rules].sort(
-    (a, b) => (activations.get(b.name)?.size ?? 0) - (activations.get(a.name)?.size ?? 0)
-  );
-  for (const rule of sorted) {
-    const count = activations.get(rule.name)?.size ?? 0;
-    const pct = totalSessions > 0 ? Math.round((100 * count) / totalSessions) : 0;
-    const type = rule.alwaysApply ? 'alwaysApply' : 'scoped';
-    const globsStr = rule.alwaysApply ? '—' : rule.globs.join(', ');
-    console.log(`| ${rule.name} | ${type} | ${truncate(globsStr, 60)} | ${count} | ${pct}% |`);
-  }
-  console.log('');
-  console.log(
-    `_Note: "matched" means the rule's globs would have matched at least one file touched in the session — i.e. the rule was eligible to fire. It does not confirm the harness actually injected the rule's content._`
-  );
+  return map;
 }
 
 // ---------------------------------------------------------------------------
 // Report
 // ---------------------------------------------------------------------------
 
-function readLedger(): Invocation[] {
+function readLedger(): UsageRecord[] {
   if (!fs.existsSync(LEDGER)) return [];
   const lines = fs.readFileSync(LEDGER, 'utf-8').split('\n').filter(Boolean);
-  const out: Invocation[] = [];
+  const out: UsageRecord[] = [];
   for (const line of lines) {
     try {
-      out.push(JSON.parse(line) as Invocation);
+      out.push(JSON.parse(line) as UsageRecord);
     } catch {
       // skip corrupt line
     }
@@ -697,139 +495,258 @@ function readLedger(): Invocation[] {
   return out;
 }
 
-function emitReport(records: Invocation[], args: Args): void {
+interface SessionAgg {
+  session: string;
+  project: string;
+  resolvedTicket: string; // the one ticket the whole session is counted against
+  // Latest branch-derived ticket seen on this session's records, and its ts.
+  // Used as the fallback when the session isn't in the authoritative hook ledger.
+  branchTicket: string | null;
+  branchTicketTs: number;
+  models: Set<string>;
+  messages: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  cost: number;
+  firstTs: number;
+  lastTs: number;
+}
+
+// ---------------------------------------------------------------------------
+// Report data — the structured result. This module computes data only; all
+// presentation (tables, formatting, currency/token rendering) is the
+// consuming agent's job. Numbers are raw (cost in USD, tokens as counts,
+// timestamps as epoch ms); model ids and project slugs are unabbreviated.
+// ---------------------------------------------------------------------------
+
+export interface SessionData {
+  session: string;
+  project: string;
+  ticket: string;
+  models: string[];
+  messages: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  cost: number;
+  firstTs: number;
+  lastTs: number;
+}
+
+export interface TicketData {
+  ticket: string;
+  sessions: number;
+  cost: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheTokens: number;
+  lastTs: number;
+}
+
+export interface ModelData {
+  model: string;
+  messages: number;
+  cost: number;
+}
+
+export interface DailyData {
+  day: string; // YYYY-MM-DD (UTC)
+  cost: number;
+}
+
+export interface ExcludedProject {
+  slug: string;
+  cwd: string | null;
+  records: number;
+}
+
+/**
+ * Ingestion + sanity info, carried IN the JSON rather than printed to stderr so
+ * stdout stays pure JSON for the consuming agent. `unpricedModels` is the one
+ * the agent should surface — those messages counted as $0, so the total is low.
+ */
+export interface Diagnostics {
+  filesTracked: number;
+  newRecords: number;
+  filesProcessed: number;
+  unparseable: number;
+  modelsSeen: { model: string; count: number }[];
+  unpricedModels: string[];
+}
+
+export interface ReportData {
+  windowDays: number;
+  sinceMs: number;
+  scope: string; // project slug, or "all projects"
+  repoFilter: 'on' | 'off';
+  totalCost: number;
+  recordsInWindow: number;
+  ledgerTotal: number;
+  excludedProjects: ExcludedProject[];
+  tickets: TicketData[]; // sorted by cost desc
+  sessions: SessionData[]; // sorted by cost desc
+  byModel: ModelData[]; // sorted by cost desc
+  daily: DailyData[]; // sorted by day asc
+  diagnostics?: Diagnostics;
+}
+
+/**
+ * Pure: derives every metric the report needs from the ledger and returns it
+ * as a plain object. No I/O, no console output, no formatting. The agent that
+ * calls this owns all presentation.
+ */
+export function buildReportData(records: UsageRecord[], args: Args): ReportData {
   const windowStart = Date.now() - args.days * 86400_000;
   const projectFilter = args.allProjects ? null : args.project ?? cwdSlug();
+  const ticketLedger = loadTicketLedger();
 
   let filtered = records.filter(
     (r) => r.ts >= windowStart && (!projectFilter || r.project === projectFilter)
   );
 
   // Repo filter — default ON; opt out with --include-non-repos
-  const excludedProjects = new Map<string, number>();
+  const excludedCounts = new Map<string, number>();
   if (!args.includeNonRepos) {
-    const before = filtered.length;
     filtered = filtered.filter((r) => {
       if (isProjectIncluded(r.project)) return true;
-      excludedProjects.set(r.project, (excludedProjects.get(r.project) ?? 0) + 1);
+      excludedCounts.set(r.project, (excludedCounts.get(r.project) ?? 0) + 1);
       return false;
     });
-    if (before !== filtered.length) {
-      console.error(
-        `Excluded ${before - filtered.length} invocations from ${excludedProjects.size} non-repo project(s) — use --include-non-repos to keep them.`
-      );
-    }
   }
+  const excludedProjects: ExcludedProject[] = Array.from(excludedCounts.entries())
+    .sort((a, b) => b[1] - a[1])
+    .map(([slug, records]) => ({ slug, cwd: slugToCwd(slug), records }));
 
-  console.log(`# AI Resource Stats\n`);
-  console.log(`- Window: last ${args.days} days (since ${new Date(windowStart).toISOString()})`);
-  console.log(`- Scope: ${projectFilter ?? 'all projects'}`);
-  console.log(`- Repo filter: ${args.includeNonRepos ? 'OFF (all projects)' : 'ON (.git/.github/package.json required)'}`);
-  console.log(`- Total invocations in window: ${filtered.length}`);
-  console.log(`- Ledger total records: ${records.length}\n`);
+  const base: ReportData = {
+    windowDays: args.days,
+    sinceMs: windowStart,
+    scope: projectFilter ?? 'all projects',
+    repoFilter: args.includeNonRepos ? 'off' : 'on',
+    totalCost: 0,
+    recordsInWindow: filtered.length,
+    ledgerTotal: records.length,
+    excludedProjects,
+    tickets: [],
+    sessions: [],
+    byModel: [],
+    daily: [],
+  };
 
-  if (excludedProjects.size > 0) {
-    console.log(`## Excluded non-repo projects\n`);
-    console.log(`| Project slug | Resolved cwd | Invocations excluded |`);
-    console.log(`|--------------|--------------|---------------------:|`);
-    for (const [slug, n] of Array.from(excludedProjects.entries()).sort((a, b) => b[1] - a[1])) {
-      const cwd = slugToCwd(slug) ?? '_(could not resolve)_';
-      console.log(`| \`${slug}\` | \`${cwd}\` | ${n} |`);
-    }
-    console.log('');
-  }
+  if (filtered.length === 0) return base;
 
-  if (filtered.length === 0) {
-    console.log('_No invocations in the window._');
-    return;
-  }
+  base.totalCost = filtered.reduce((s, r) => s + recordCost(r), 0);
 
-  // ---- By resource -----------------------------------------------------
-  const groups = new Map<string, Invocation[]>();
+  // ---- Aggregate per session ------------------------------------------
+  // A session is attributed to ONE ticket and counted against it in full.
+  // The common workflow is: start on `main`, ask Claude to cut a Jira branch,
+  // then work — so early messages happen on `main`. Counting per-record would
+  // strand those under "(untracked)". Instead we resolve a single ticket per
+  // session (the hook ledger's last entry, else the most-recent branch the
+  // session was on) and attribute the whole session's cost to it.
+  const sessions = new Map<string, SessionAgg>();
   for (const r of filtered) {
-    const key = `${r.kind}/${r.resource}`;
-    if (!groups.has(key)) groups.set(key, []);
-    groups.get(key)!.push(r);
+    let s = sessions.get(r.session);
+    if (!s) {
+      s = {
+        session: r.session,
+        project: r.project,
+        resolvedTicket: '(untracked)',
+        branchTicket: null,
+        branchTicketTs: -1,
+        models: new Set(),
+        messages: 0,
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        cost: 0,
+        firstTs: r.ts,
+        lastTs: r.ts,
+      };
+      sessions.set(r.session, s);
+    }
+    s.models.add(r.model);
+    s.messages++;
+    s.inputTokens += r.inputTokens;
+    s.outputTokens += r.outputTokens;
+    s.cacheReadTokens += r.cacheReadTokens;
+    s.cacheWriteTokens += r.cacheWrite5mTokens + r.cacheWrite1hTokens;
+    s.cost += recordCost(r);
+    s.firstTs = Math.min(s.firstTs, r.ts);
+    s.lastTs = Math.max(s.lastTs, r.ts);
+    // Track the latest branch the session switched to (ignores main / null).
+    if (r.ticket && r.ts >= s.branchTicketTs) {
+      s.branchTicket = r.ticket;
+      s.branchTicketTs = r.ts;
+    }
   }
-  const sorted = Array.from(groups.entries()).sort((a, b) => b[1].length - a[1].length);
-
-  console.log(`## By resource\n`);
-  console.log(`| Kind | Resource | Invocations | Success | Avg return (chars) | Avg duration (ms) | Top trigger |`);
-  console.log(`|------|----------|------------:|--------:|-------------------:|------------------:|-------------|`);
-  for (const [key, group] of sorted) {
-    const [kind, resource] = key.split('/');
-    const n = group.length;
-    const success = group.filter((g) => g.succeeded).length;
-    const successPct = Math.round((100 * success) / n);
-    const avgChars = Math.round(group.reduce((s, g) => s + g.returnChars, 0) / n);
-    const avgMs = Math.round(group.reduce((s, g) => s + g.durationMs, 0) / n);
-    const trigger = mostRecentTrigger(group);
-    console.log(
-      `| ${kind} | ${resource} | ${n} | ${successPct}% | ${avgChars} | ${avgMs} | ${truncate(trigger, 60)} |`
-    );
+  // Resolve each session's single ticket: authoritative hook ledger wins, else
+  // the most-recent Jira branch the session checked out, else untracked.
+  for (const s of sessions.values()) {
+    s.resolvedTicket = ticketLedger.get(s.session) ?? s.branchTicket ?? '(untracked)';
   }
 
-  // ---- Sidechain breakdown --------------------------------------------
-  const top = filtered.filter((r) => !r.isSidechain).length;
-  const side = filtered.length - top;
-  console.log(`\n## Top-level vs sidechain\n`);
-  console.log(`- Top-level invocations: ${top}`);
-  console.log(`- Sidechain (nested) invocations: ${side}`);
+  // ---- Sessions aggregated per Jira ticket ----------------------------
+  // Whole-session attribution: every session contributes its full totals to its
+  // single resolved ticket.
+  const byTicket = new Map<string, TicketData>();
+  for (const s of sessions.values()) {
+    let t = byTicket.get(s.resolvedTicket);
+    if (!t) {
+      t = { ticket: s.resolvedTicket, sessions: 0, cost: 0, inputTokens: 0, outputTokens: 0, cacheTokens: 0, lastTs: s.lastTs };
+      byTicket.set(s.resolvedTicket, t);
+    }
+    t.sessions++;
+    t.cost += s.cost;
+    t.inputTokens += s.inputTokens;
+    t.outputTokens += s.outputTokens;
+    t.cacheTokens += s.cacheReadTokens + s.cacheWriteTokens;
+    t.lastTs = Math.max(t.lastTs, s.lastTs);
+  }
+  base.tickets = Array.from(byTicket.values()).sort((a, b) => b.cost - a.cost);
 
-  // ---- Daily volume ----------------------------------------------------
+  // ---- Per-session rows -----------------------------------------------
+  base.sessions = Array.from(sessions.values())
+    .sort((a, b) => b.cost - a.cost)
+    .map((s) => ({
+      session: s.session,
+      project: s.project,
+      ticket: s.resolvedTicket,
+      models: Array.from(s.models),
+      messages: s.messages,
+      inputTokens: s.inputTokens,
+      outputTokens: s.outputTokens,
+      cacheReadTokens: s.cacheReadTokens,
+      cacheWriteTokens: s.cacheWriteTokens,
+      cost: s.cost,
+      firstTs: s.firstTs,
+      lastTs: s.lastTs,
+    }));
+
+  // ---- Cost by model --------------------------------------------------
+  const byModel = new Map<string, ModelData>();
+  for (const r of filtered) {
+    const m = byModel.get(r.model) ?? { model: r.model, messages: 0, cost: 0 };
+    m.cost += recordCost(r);
+    m.messages++;
+    byModel.set(r.model, m);
+  }
+  base.byModel = Array.from(byModel.values()).sort((a, b) => b.cost - a.cost);
+
+  // ---- Daily cost -----------------------------------------------------
   const byDay = new Map<string, number>();
   for (const r of filtered) {
     const day = new Date(r.ts).toISOString().slice(0, 10);
-    byDay.set(day, (byDay.get(day) ?? 0) + 1);
+    byDay.set(day, (byDay.get(day) ?? 0) + recordCost(r));
   }
-  console.log(`\n## Daily volume\n`);
-  console.log(`| Day | Invocations |`);
-  console.log(`|-----|------------:|`);
-  for (const [day, n] of Array.from(byDay.entries()).sort()) {
-    console.log(`| ${day} | ${n} |`);
-  }
+  base.daily = Array.from(byDay.entries())
+    .sort()
+    .map(([day, cost]) => ({ day, cost }));
 
-  // ---- Rule activations (single-project scope only) -------------------
-  if (projectFilter) {
-    const repoCwd = slugToCwd(projectFilter);
-    if (!repoCwd) {
-      console.log(
-        `\n_(Skipping rule activations: could not resolve cwd for slug \`${projectFilter}\`.)_`
-      );
-    } else {
-      const rules = loadProjectRules(repoCwd);
-      if (rules.length === 0) {
-        console.log(
-          `\n_(Skipping rule activations: no \`.ai/rules/\` directory found at \`${repoCwd}\`.)_`
-        );
-      } else {
-        const result = computeRuleActivations(projectFilter, rules, repoCwd, windowStart);
-        emitRuleActivationsTable(
-          rules,
-          result.activations,
-          result.totalSessions,
-          result.sessionsWithoutTouches,
-          repoCwd
-        );
-      }
-    }
-  } else {
-    console.log(
-      `\n_(Skipping rule activations: rules are per-project. Re-run without \`--all-projects\` to see them for the current project.)_`
-    );
-  }
-}
-
-function mostRecentTrigger(group: Invocation[]): string {
-  for (let i = group.length - 1; i >= 0; i--) {
-    if (group[i].precedingUserText.trim()) return group[i].precedingUserText;
-  }
-  return '(none captured)';
-}
-
-function truncate(s: string, n: number): string {
-  const cleaned = s.replace(/[\r\n]+/g, ' ');
-  return cleaned.length > n ? cleaned.slice(0, n - 1) + '…' : cleaned;
+  return base;
 }
 
 // ---------------------------------------------------------------------------
@@ -840,35 +757,34 @@ function main(): void {
   const args = parseArgs(process.argv.slice(2));
 
   if (args.rebuild) {
-    console.error(`Rebuilding: removing ${LEDGER} and ${STATE}`);
     fs.rmSync(LEDGER, { force: true });
     fs.rmSync(STATE, { force: true });
   }
 
   const state = loadState();
-  console.error(`Loaded state: ${Object.keys(state.files).length} files tracked`);
-
+  const filesTracked = Object.keys(state.files).length;
   const ingestStats = ingest(state);
-  console.error(
-    `Ingested ${ingestStats.appended} new invocations from ${ingestStats.filesProcessed} files`
-  );
-  if (ingestStats.unparseable > 0) {
-    console.error(`Skipped ${ingestStats.unparseable} unparseable line(s)`);
-  }
-  if (ingestStats.unknownSamples.length > 0) {
-    console.error(`Sample unknown event shapes (first ${ingestStats.unknownSamples.length}):`);
-    for (const s of ingestStats.unknownSamples) console.error(`  ${s}`);
-  }
-  if (ingestStats.toolNameCounts.size > 0) {
-    const sorted = Array.from(ingestStats.toolNameCounts.entries()).sort((a, b) => b[1] - a[1]);
-    console.error(`Tool names seen in assistant messages (all projects):`);
-    for (const [name, n] of sorted) console.error(`  ${name}: ${n}`);
-  }
-
   saveState(state);
 
   const records = readLedger();
-  emitReport(records, args);
+  const data = buildReportData(records, args);
+
+  // Carry diagnostics inside the JSON so stdout is a single pure-JSON document —
+  // nothing on stderr to interleave, whatever the caller's shell does with fd2.
+  data.diagnostics = {
+    filesTracked,
+    newRecords: ingestStats.appended,
+    filesProcessed: ingestStats.filesProcessed,
+    unparseable: ingestStats.unparseable,
+    modelsSeen: Array.from(ingestStats.modelsSeen.entries())
+      .sort((a, b) => b[1] - a[1])
+      .map(([model, count]) => ({ model, count })),
+    unpricedModels: Array.from(ingestStats.unpricedModels),
+  };
+
+  // stdout = the structured report data (JSON), and nothing else. All
+  // presentation is the consuming agent's responsibility.
+  process.stdout.write(JSON.stringify(data, null, 2) + '\n');
 }
 
 main();

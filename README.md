@@ -41,9 +41,9 @@ skills/
     SKILL.md           Reviews a PR for correctness, conventions, and test
                        coverage. Runs on Sonnet.
   ai-observability/
-    SKILL.md           Runs scripts/observability/ai-resource-stats.ts and reports
-                       agent/skill usage, success rates and daily volume from the
-                       local ledger.
+    SKILL.md           Runs scripts/observability/ai-resource-stats.ts (which emits
+                       JSON) and renders the tables: cost per session and total
+                       spend per Jira ticket, plus cost by model and daily cost.
 
 hooks/
   hooks.json           SessionStart / PostToolUse / UserPromptSubmit hooks that
@@ -57,9 +57,10 @@ hooks/
 agents/
   session-ticket-mapper.md
                        Groups sessions per Jira ticket from the session-tickets
-                       ledger, enriched from invocations.jsonl (joined on session).
-                       Defaults to incremental (sessions since its last run via a
-                       self-maintained watermark). Surfaced as /session-ticket-map.
+                       ledger, enriched with cost/tokens/models from usage.jsonl
+                       (joined on session). Defaults to incremental (sessions since
+                       its last run via a self-maintained watermark). Surfaced as
+                       /session-ticket-map.
 
 commands/
   session-ticket-map.md  Slash command wrapper for the mapper agent.
@@ -67,7 +68,11 @@ commands/
 scripts/
   observability/
     ai-resource-stats.ts  Pure-Node (no deps) transcript parser that builds
-                          ~/.claude/observability/invocations.jsonl. Run via npx tsx.
+                          ~/.claude/observability/usage.jsonl (per-message token
+                          usage + cost) and emits aggregated ReportData as JSON on
+                          stdout (cost per session, per Jira ticket, by model, daily)
+                          for an agent to render. Exports buildReportData(). Run via
+                          npx tsx.
 
 docs/
   cost-governance.md   Why this base exists and how it addresses the two root
@@ -120,7 +125,7 @@ On install, the `hooks/hooks.json` hooks activate automatically (no manual setti
 
 All three are deduped against a state file (`<git-dir>/claude-jira-ticket`), so they only speak up — and write a ledger line — when the ticket actually changes, never per command.
 
-The **`session-ticket-mapper`** agent (`/session-ticket-map`) then groups sessions per ticket, joining `session-tickets.jsonl` to `invocations.jsonl` (built by the `ai-observability` skill's script) on the `session` field. The two ledgers are designed to join on that key. The mapper runs incrementally by default — only sessions since its last run.
+The **`session-ticket-mapper`** agent (`/session-ticket-map`) then groups sessions per ticket, joining `session-tickets.jsonl` to `usage.jsonl` (built by the `ai-observability` skill's script) on the `session` field to attach each session's cost, token totals, and models. The two ledgers are designed to join on that key. The mapper runs incrementally by default — only sessions since its last run.
 
 **Requirements:** the hooks run with `"shell": "bash"`, so **bash must be on PATH** (Git Bash on Windows). On a PowerShell-only Windows setup the hooks silently no-op. The `ai-observability` script needs Node (it's run via `npx tsx`, no install). These features write only to the user's own `~/.claude/observability/` — no shared/network state.
 
