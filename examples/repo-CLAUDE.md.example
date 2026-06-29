@@ -1,0 +1,20 @@
+# fs-app
+<!-- Everything not stated here — model routing, session hygiene, shared skills — is inherited from the Phocas base (~/.claude/CLAUDE.md). Copy this file to your repo root as CLAUDE.md and edit to match your codebase. -->
+
+## Repo context
+
+Key areas to know about before reading code in this repo:
+
+- `src/grid/` — core grid, the oldest part of the codebase. Changes here have wide blast radius; handle with care and prefer small, targeted edits.
+- `src/dashboards/` — newer and more experimental. Conventions are still evolving and the team welcomes suggestions.
+- `src/charts/` — chart-builder, owned by the visualisation team. Coordinate with them before making structural changes.
+
+## Model override for this repo
+
+For E2E test debugging in this repo, use Opus rather than Sonnet. The test output is verbose and tracks async timing in a way that Sonnet regularly misses; Opus is worth the cost here. For all other work — coding, PR reviews, refactors, branch creation — the base routing table applies.
+
+## Local conventions
+
+- Never edit files under `.generated/` — they are produced by the build pipeline and will be overwritten on the next build.
+- Run `pnpm test:e2e --headed` before marking any E2E task complete.
+- New components go under `src/components/[feature-name]/`.

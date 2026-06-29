@@ -1,0 +1,13 @@
+{
+  "name": "phocas",
+  "owner": {
+    "name": "Phocas Software"
+  },
+  "plugins": [
+    {
+      "name": "phocas-base",
+      "source": "./",
+      "description": "Shared Claude base context, settings, model-routed skills, cost-visibility status bar, and session→ticket observability (hooks + mapper agent) for all Phocas engineers."
+    }
+  ]
+}

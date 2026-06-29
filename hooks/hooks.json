@@ -1,0 +1,38 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "INPUT=$(cat); SID=$(printf '%s' \"$INPUT\" | sed -nE 's/.*\"session_id\"[[:space:]]*:[[:space:]]*\"([^\"]*)\".*/\\1/p' | head -1); BR=$(git rev-parse --abbrev-ref HEAD 2>/dev/null); CODE=$(printf '%s' \"$BR\" | grep -oE '^[A-Z]+-[0-9]+'); GD=$(git rev-parse --git-dir 2>/dev/null); [ -n \"$GD\" ] && printf '%s' \"$CODE\" > \"$GD/claude-jira-ticket\"; if [ -n \"$CODE\" ]; then LDIR=\"$HOME/.claude/observability\"; mkdir -p \"$LDIR\"; printf '{\"ts\":%s,\"session\":\"%s\",\"ticket\":\"%s\",\"branch\":\"%s\",\"event\":\"SessionStart\"}\\n' \"$(date +%s%3N)\" \"$SID\" \"$CODE\" \"$BR\" >> \"$LDIR/session-tickets.jsonl\"; printf '{\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\",\"additionalContext\":\"Active Jira ticket for this session: %s (derived from the current git branch name). Treat %s as the ticket reference for this work - use it when committing, creating branches, and opening PRs.\"}}' \"$CODE\" \"$CODE\"; fi",
+            "shell": "bash"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "INPUT=$(cat); SID=$(printf '%s' \"$INPUT\" | sed -nE 's/.*\"session_id\"[[:space:]]*:[[:space:]]*\"([^\"]*)\".*/\\1/p' | head -1); BR=$(git rev-parse --abbrev-ref HEAD 2>/dev/null); CODE=$(printf '%s' \"$BR\" | grep -oE '^[A-Z]+-[0-9]+'); GD=$(git rev-parse --git-dir 2>/dev/null); [ -z \"$GD\" ] && exit 0; PREV=$(cat \"$GD/claude-jira-ticket\" 2>/dev/null); if [ \"$CODE\" != \"$PREV\" ]; then printf '%s' \"$CODE\" > \"$GD/claude-jira-ticket\"; if [ -n \"$CODE\" ]; then LDIR=\"$HOME/.claude/observability\"; mkdir -p \"$LDIR\"; printf '{\"ts\":%s,\"session\":\"%s\",\"ticket\":\"%s\",\"branch\":\"%s\",\"event\":\"BranchChange\"}\\n' \"$(date +%s%3N)\" \"$SID\" \"$CODE\" \"$BR\" >> \"$LDIR/session-tickets.jsonl\"; printf '{\"hookSpecificOutput\":{\"hookEventName\":\"PostToolUse\",\"additionalContext\":\"Git branch changed - the active Jira ticket is now %s. Use %s as the ticket reference for commits, branches, and PRs from now on.\"}}' \"$CODE\" \"$CODE\"; fi; fi",
+            "shell": "bash"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "INPUT=$(cat); SID=$(printf '%s' \"$INPUT\" | sed -nE 's/.*\"session_id\"[[:space:]]*:[[:space:]]*\"([^\"]*)\".*/\\1/p' | head -1); BR=$(git rev-parse --abbrev-ref HEAD 2>/dev/null); CODE=$(printf '%s' \"$BR\" | grep -oE '^[A-Z]+-[0-9]+'); GD=$(git rev-parse --git-dir 2>/dev/null); [ -z \"$GD\" ] && exit 0; PREV=$(cat \"$GD/claude-jira-ticket\" 2>/dev/null); if [ \"$CODE\" != \"$PREV\" ]; then printf '%s' \"$CODE\" > \"$GD/claude-jira-ticket\"; if [ -n \"$CODE\" ]; then LDIR=\"$HOME/.claude/observability\"; mkdir -p \"$LDIR\"; printf '{\"ts\":%s,\"session\":\"%s\",\"ticket\":\"%s\",\"branch\":\"%s\",\"event\":\"BranchChange\"}\\n' \"$(date +%s%3N)\" \"$SID\" \"$CODE\" \"$BR\" >> \"$LDIR/session-tickets.jsonl\"; printf '{\"hookSpecificOutput\":{\"hookEventName\":\"UserPromptSubmit\",\"additionalContext\":\"Active Jira ticket is now %s (branch changed since the last check). Use %s as the ticket reference for commits, branches, and PRs.\"}}' \"$CODE\" \"$CODE\"; fi; fi",
+            "shell": "bash"
+          }
+        ]
+      }
+    ]
+  }
+}

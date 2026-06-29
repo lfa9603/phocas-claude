@@ -1,0 +1,10 @@
+{
+  "name": "phocas-base",
+  "version": "0.2.0",
+  "description": "Phocas company-wide Claude base: shared CLAUDE.md, Sonnet-default settings, model-routed skills, the cost-visibility status bar, and session→ticket observability (branch-derived ticket hooks + ledger, mapper agent, AI usage reporting).",
+  "author": {
+    "name": "Phocas AI Champions"
+  },
+  "homepage": "https://github.com/lfa9603/phocas-claude",
+  "hooks": "./hooks/hooks.json"
+}
